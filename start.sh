@@ -13,6 +13,90 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 VENV_DIR="$PROJECT_DIR/venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+APP_HOST="0.0.0.0"
+APP_PORT="8080"
+USER_ARGS=("$@")
+
+for ((i = 0; i < ${#USER_ARGS[@]}; i++)); do
+    case "${USER_ARGS[$i]}" in
+        --host)
+            if ((i + 1 < ${#USER_ARGS[@]})); then
+                APP_HOST="${USER_ARGS[$((i + 1))]}"
+            fi
+            ;;
+        --host=*)
+            APP_HOST="${USER_ARGS[$i]#--host=}"
+            ;;
+        --port)
+            if ((i + 1 < ${#USER_ARGS[@]})); then
+                APP_PORT="${USER_ARGS[$((i + 1))]}"
+            fi
+            ;;
+        --port=*)
+            APP_PORT="${USER_ARGS[$i]#--port=}"
+            ;;
+    esac
+done
+
+if ! [[ "$APP_PORT" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --port value: $APP_PORT"
+    exit 1
+fi
+
+kill_pids() {
+    local label="$1"
+    shift
+    local pids=("$@")
+
+    if [ ${#pids[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo "      Stopping $label: ${pids[*]}"
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    sleep 2
+
+    local alive=()
+    local pid
+    for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            alive+=("$pid")
+        fi
+    done
+
+    if [ ${#alive[@]} -gt 0 ]; then
+        echo "      Force stopping $label: ${alive[*]}"
+        kill -KILL "${alive[@]}" 2>/dev/null || true
+    fi
+}
+
+cleanup_previous_runs() {
+    echo "[0/6] Cleaning up previous running processes..."
+
+    local pids=()
+    local pid
+
+    if command -v pgrep >/dev/null 2>&1; then
+        while read -r pid; do
+            [ -n "$pid" ] && [ "$pid" != "$$" ] && pids+=("$pid")
+        done < <(pgrep -f "python.*gradio_app.py" || true)
+        kill_pids "old gradio_app.py processes" "${pids[@]}"
+    fi
+
+    pids=()
+    if command -v fuser >/dev/null 2>&1; then
+        for pid in $(fuser "${APP_PORT}/tcp" 2>/dev/null || true); do
+            [ -n "$pid" ] && [ "$pid" != "$$" ] && pids+=("$pid")
+        done
+    elif command -v lsof >/dev/null 2>&1; then
+        while read -r pid; do
+            [ -n "$pid" ] && [ "$pid" != "$$" ] && pids+=("$pid")
+        done < <(lsof -ti tcp:"$APP_PORT" 2>/dev/null || true)
+    fi
+    kill_pids "processes using port $APP_PORT" "${pids[@]}"
+}
+
+cleanup_previous_runs
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
@@ -28,6 +112,13 @@ else
     echo "[1/6] Virtual environment already exists."
 fi
 source "$VENV_DIR/bin/activate"
+hash -r
+if [ "${VIRTUAL_ENV:-}" != "$VENV_DIR" ]; then
+    echo "Failed to activate virtual environment: $VENV_DIR"
+    exit 1
+fi
+echo "      Activated venv: $VIRTUAL_ENV"
+echo "      Python: $(command -v python)"
 python -m pip install --upgrade pip -q
 
 # ── 2. PyTorch ───────────────────────────────────────────────────────────────
@@ -124,14 +215,21 @@ except Exception:
 PYDEVICE
 )
 echo "Using device: $APP_DEVICE"
+EXTERNAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+EXTERNAL_IP="${EXTERNAL_IP:-YOUR_VM_EXTERNAL_IP}"
+echo "Binding host: $APP_HOST"
+echo "Port: $APP_PORT"
+echo "Open: http://$EXTERNAL_IP:$APP_PORT"
 echo ""
 
 # Defaults match the repository's multiview turbo Gradio example.
-python gradio_app.py \
+"$VENV_DIR/bin/python" gradio_app.py \
     --model_path tencent/Hunyuan3D-2mv \
     --subfolder hunyuan3d-dit-v2-mv-turbo \
     --texgen_model_path tencent/Hunyuan3D-2 \
+    --host "$APP_HOST" \
+    --port "$APP_PORT" \
     --device "$APP_DEVICE" \
     --low_vram_mode \
     --enable_flashvdm \
-    "$@"
+    "${USER_ARGS[@]}"
